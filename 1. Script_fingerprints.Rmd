@@ -1,0 +1,681 @@
+---
+title: "1. script_fingerprints"
+author: "Fleur Cornelissen"
+date: "2/7/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+#download libraries needed 
+library(xgboost)
+library(drat)
+library(DiagrammeR)
+library(Matrix)
+library(caret)
+library(proxy)
+library(e1071)
+library(yardstick)
+library(ggplot2)
+library(caTools)
+library(Rtsne)
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(stringr)
+library(ggpubr)
+library(gplots)
+library(tidyverse)
+library(Rtsne)
+library(fingerprint)
+library(rcdk)
+library(pROC)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+
+aMF_BBB_MACCS <- as.data.frame(aMF_XG_BBB[,2]) # copy SMILES list dataset in one dataframe
+colnames(aMF_BBB_MACCS) <- "ParentSmiles" # Set column name
+aMF_BBB_MACCS$MACCS <- NA # Generate column without data (NA), column name "MACCS" 
+
+#create a loop to generate all MACCS fingeprints for all SMILES 
+for (row in 1:nrow(aMF_BBB_MACCS)) {
+                mols <- parse.smiles(aMF_BBB_MACCS[row,"ParentSmiles"])
+
+                MACCS <- aMF_BBB_MACCS[row, "MACCS"]
+                
+                fp <- get.fingerprint(mols[[1]], type = 'maccs',
+                      fp.mode = 'bit', verbose=FALSE)
+
+                a <- as.character(fp)
+
+                aMF_BBB_MACCS[row,"MACCS"] <- a}
+
+aMF_BBB_MACCS <- as.data.frame(str_split_fixed(aMF_BBB_MACCS$MACCS, "", 166)) #split "MACCS" column (containing MACCS fingerprints), into 166 columns (i.e. bits)
+Status.BBB <- as.integer(aMF_XG_BBB$Status.BBB)-1 # create   Status column (0-1) 
+
+aMF_BBB_MACCS <- cbind(Status.BBB, aMF_BBB_MACCS) # Combine Status column with MACCS fingerprint file
+aMF_BBB_MACCS$Status.BBB <- as.integer(aMF_BBB_MACCS$Status.BBB) # set as integer (to prevent bugg I think)
+
+aMF_BBB_MACCS <- lapply(aMF_BBB_MACCS,as.numeric) # set all numbers as numerics
+aMF_BBB_MACCS <- as.data.frame(aMF_BBB_MACCS) # set data in "dataframe"  mode
+str(aMF_BBB_MACCS) # check summary data
+rownames(aMF_BBB_MACCS) <- aMF_XG_BBB$ID # set ID numbers as rownames dataframe (ID numbers copied from properties file)
+
+# TSNE (https://datavizpyr.com/how-to-make-tsne-plot-in-r/)
+# Let us select numerical columns using is.numeric() function with select(), standardise the data using scale() function before applying Rstne() function to perform tSNE.
+tSNE <- aMF_BBB_MACCS[,c(2:167)]
+set.seed(142)
+tSNE_fit <- tSNE %>%
+  select(where(is.numeric)) %>%
+  Rtsne(check_duplicates = FALSE)
+
+#The tSNE result object contains two tSNE components that we are interested in. We can extract the components and save it in a dataframe.
+
+test <- tSNE_fit$Y %>% 
+  as.data.frame() %>%
+  rename(tSNE1="V1",
+         tSNE2="V2") 
+
+aMF_XG_BBB$x.f <- test$tSNE1 #copy coordinates tsne to original dataframe
+aMF_XG_BBB$y.f <- test$tSNE2 #copy coordinates tsne to original dataframe
+
+# plot tSNE
+aMF_XG_BBB %>%
+  ggplot(aes(x = x.f, 
+             y = y.f,
+             color = Status.BBB))+
+  geom_point(size=1.5) +
+  theme_classic() + theme(legend.position = "right") + ggtitle("BBB Status")
+
+#ggsave("tSNE_plot_example1.png") 
+```
+
+```{r cars}
+
+#############
+# XGBoost #
+
+#train
+trainID <- subset(aMF_XG_BBB, aMF_XG_BBB$set == "Train")
+testID <- subset(aMF_XG_BBB, aMF_XG_BBB$set == "Test")
+valID <- subset(aMF_XG_BBB, aMF_XG_BBB$set == "Val")
+
+XG_BBBtrain_c <- subset(aMF_BBB_MACCS, rownames(aMF_BBB_MACCS) %in% trainID$ID)
+XG_BBBtest_c <- subset(aMF_BBB_MACCS, rownames(aMF_BBB_MACCS) %in% testID$ID)
+XG_BBBval_c <- subset(aMF_BBB_MACCS, rownames(aMF_BBB_MACCS) %in% valID$ID)
+
+XG_BBBtest_c$set <- "Test"
+XG_BBBtrain_c$set <- "Train"
+XG_BBBval_c$set <- "Val"
+
+# XG_BBBtrain_c <- sapply(XG_BBBtrain_c,as.numeric)
+# XG_BBBtest_c <- sapply(XG_BBBtest_c,as.numeric)
+# 
+XG_BBBtrain <- as.data.frame(XG_BBBtrain_c[,c(1:167)]) 
+XG_BBBtest <- as.data.frame(XG_BBBtest_c[,c(1:167)])
+XG_BBBval <- as.data.frame(XG_BBBval_c[,c(1:167)])
+
+
+# create dgcMatrix for analysis
+sparse_matrix <- sparse.model.matrix(Status.BBB ~.-1, data = XG_BBBtrain) 
+sparse_matrix_test <- sparse.model.matrix(Status.BBB ~.-1, data = XG_BBBtest)
+
+# create output vectors for test and training set
+output_vector = XG_BBBtrain[,"Status.BBB"] == "1" # Status of train set TRUE = 1
+output_vector_test = XG_BBBtest[,"Status.BBB"] == "1" # Status of test set TRUE = 1
+output_vector2 = XG_BBBtrain[,"Status.BBB"] # for confusion matrix
+output_vector_test2 = XG_BBBtest[,"Status.BBB"]
+
+#build the model
+bst <- xgboost(data = sparse_matrix, label = output_vector, max_depth = 5,eta = 1, nthread = 1, nrounds = 1,objective = "binary:logistic", eval_metric='logloss', eval.metric = "error", eval.metric = "auc") # doesnt change when changing settings, train-logloss bit lower after 3 rounds
+
+dtrain_sm <- xgb.DMatrix(data = sparse_matrix, label = output_vector)
+dtest_sm <- xgb.DMatrix(data = sparse_matrix_test, label = output_vector_test)
+bstDMatrix_sm <- xgboost(data = dtrain_sm, max_depth = 5,
+               eta = 1, nthread = 1, nrounds = 1,objective = "binary:logistic", eval_metric='logloss', eval.metric = "error", eval.metric="auc") 
+# OUTPUT same as described above
+
+#predict test data
+pred <- predict(bst, sparse_matrix_test) 
+print(length(pred)) # size prediction vector
+print(head(pred)) # data results not binary yet
+prediction <- as.numeric(pred > 0.5)#transform to binary classification
+print(head(prediction))
+
+#measuring model performance
+err <- mean(as.numeric(pred > 0.5) != output_vector_test)
+print(paste("test-error=", err))
+
+# Measuring loearning progress with xgb.train
+# Check the learning process of a model to test it on both training en test set
+watchlist <- list(train=dtrain_sm, test=dtest_sm)
+bst <- xgb.train(data=dtrain_sm, max_depth = 5,eta = 1, nthread = 1, nrounds = 1, watchlist=watchlist, eval.metric = "logloss", eval.metric = "error", eval.metric = "auc", objective = "binary:logistic")
+
+#measure feature importance
+importance <- xgb.importance(feature_names = colnames(sparse_matrix), model = bst)
+head(importance) 
+
+importanceRaw <- xgb.importance(feature_names = colnames(sparse_matrix), model = bst, data = sparse_matrix, label = output_vector)
+
+# Cleaning for better display
+importanceClean <- importanceRaw[,`:=`(Cover=NULL, Frequency=NULL)]
+head(importanceClean) #In the table above we have removed two not needed columns and select only the first lines.Feature are al the splits used
+tiff(file="MF_BBB_fing_feature.tiff", width=5, height=5, units="in", res=300)
+xgb.plot.importance(importance_matrix = importance, top_n = 18) #plot
+dev.off()
+
+# Do the results make sense?
+# higher chi2 means better correlation
+c2 <- chisq.test(XG_BBBtrain$V8, output_vector, simulate.p.value=T)
+print(c2) # pearson correlation between Status and TPSA is 1278.9 
+
+# View trees model
+xgb.dump(bst, trees = 0, with_stats = TRUE)
+xgb.plot.tree(model = bst) 
+xgb.plot.tree(model = bst, trees = 0, show_node_id = TRUE)
+
+# get prediction results of trainingset
+pred_tr <- predict(bst, dtrain_sm)
+print(head(pred_tr)) # data results not binary yet
+label_prob_tr <- as.data.frame(pred_tr)
+colnames(label_prob_tr) <- "BBB.Probability.MACCS"
+
+prediction_tr<- as.numeric(pred_tr > 0.5)#transform to binary classification
+print(head(prediction_tr))
+label_pred_tr<- as.data.frame(prediction_tr)
+colnames(label_pred_tr) <- "BBB.Prediction.MACCS" 
+
+# Confusion matrices
+confusionMatrix(table(ifelse(pred <= 0.5, 0, 1), output_vector_test2), positive = "1") #test
+confusionMatrix(table(ifelse(pred_tr <= 0.5, 0, 1), output_vector2), positive = "1") #training
+
+### VALIDATION
+
+# create dgcMatrix for analysis
+sparse_matrix_df_test <- sparse.model.matrix(Status.BBB ~.-1, data = XG_BBBval)
+
+# create output vectors for test and training set
+output_vector_df_test = XG_BBBval[,"Status.BBB"] == "1" # Status of test set TRUE = 1
+output_vector_df_test2 = XG_BBBval[,"Status.BBB"]  # Status of test set TRUE = 1
+
+df1_test <- xgb.DMatrix(data = sparse_matrix_df_test, label = output_vector_df_test)
+
+#predict test data
+pred_df <- predict(bst, sparse_matrix_df_test) 
+print(length(pred_df)) # size prediction vector
+print(head(pred_df)) # data results not binary yet
+prediction_df <- as.numeric(pred_df > 0.5)#transform to binary classification
+print(head(prediction_df))
+
+#Confusion matrix
+confusionMatrix(table(ifelse(pred_df <= 0.5, 0, 1), output_vector_df_test2))
+
+#measuring model performance
+err <- mean(as.numeric(pred_df > 0.5) != output_vector_df_test)
+print(paste("test-error=", err))
+
+# Check the learning process of a model to test it on both training en test set
+watchlist <- list(train=dtrain_sm, test=df1_test)
+bst <- xgb.train(data=dtrain_sm, max_depth = 5,eta = 1, nthread = 1, nrounds = 1, watchlist=watchlist, eval.metric = "error", eval.metric = "logloss", eval.metric = "auc", objective = "binary:logistic")
+
+# load into orignal dataframes
+  #VAL
+label_prob_df  <- as.data.frame(pred_df)
+colnames(label_prob_df) <- "BBB.Probability.MACCS"
+label_pred_df <- as.data.frame(prediction_df)
+colnames(label_pred_df) <- "BBB.Prediction.MACCS"  
+
+  #TEST
+label_prob_te <- as.data.frame(pred)
+colnames(label_prob_te) <- "BBB.Probability.MACCS" #S single (only tested on dataset)
+label_pred_te  <- as.data.frame(prediction) #binary
+colnames(label_pred_te) <- "BBB.Prediction.MACCS"
+
+XG_BBBtrain_c1 <- cbind(XG_BBBtrain_c, label_prob_tr, label_pred_tr, trainID)
+XG_BBBtest_c1 <- cbind(XG_BBBtest_c, label_prob_te, label_pred_te, testID)
+XG_BBBval_c1 <- cbind(XG_BBBval_c, label_prob_df, label_pred_df, valID)
+
+x <- rbind(XG_BBBtrain_c1[,c(168:171)],XG_BBBtest_c1[,c(168:171)], XG_BBBval_c1[,c(168:171)]) # bind prediction outcomes train/test NB check column numbers!
+
+aMF_XG_BBB$BBB.Probability.MACCS <- x$BBB.Probability.MACCS[match(aMF_XG_BBB$ID, x$ID)] # Match IDs
+aMF_XG_BBB$BBB.Prediction.MACCS <- x$BBB.Prediction.MACCS[match(aMF_XG_BBB$ID, x$ID)] # Match IDs
+
+aMF_XG_BBB$CM.maccs <- "FN"
+aMF_XG_BBB$CM.maccs[aMF_XG_BBB$BBB.Prediction.MACCS == "1" & aMF_XG_BBB$Status.BBB == 0] <- "FP" 
+aMF_XG_BBB$CM.maccs[aMF_XG_BBB$BBB.Prediction.MACCS == "0" & aMF_XG_BBB$Status.BBB == 0] <- "TN" 
+aMF_XG_BBB$CM.maccs[aMF_XG_BBB$BBB.Prediction.MACCS == "1" & aMF_XG_BBB$Status.BBB == 1] <- "TP" 
+aMF_XG_BBB$CM.maccs <- as.factor(aMF_XG_BBB$CM.maccs)
+summary(aMF_XG_BBB$CM.maccs) #FN 66 FP 181 TN 327 TP 1703
+
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+# 3. Confusion matrix + ROC
+# Training
+set.seed(123)
+truth_predicted <- data.frame(
+  obs = output_vector2,
+  pred = prediction_tr)
+truth_predicted$obs <- as.factor(truth_predicted$obs)
+truth_predicted$pred <- as.factor(truth_predicted$pred)
+
+cm <- conf_mat(truth_predicted, obs, pred)
+
+autoplot(cm, type = "heatmap") +
+  scale_fill_gradient(low = "lightgrey", high = "coral1")
+
+# test
+set.seed(123)
+truth_predicted <- data.frame(
+  obs = output_vector_test2,
+  pred = prediction)
+truth_predicted$obs <- as.factor(truth_predicted$obs)
+truth_predicted$pred <- as.factor(truth_predicted$pred)
+
+cm <- conf_mat(truth_predicted, obs, pred)
+
+autoplot(cm, type = "heatmap") +
+  scale_fill_gradient(low ="lightgrey", high = "coral1")
+
+# all datasets combined
+set.seed(123)
+truth_predicted <- data.frame(
+  obs = output_vector_df_test2,
+  pred = prediction_df)
+truth_predicted$obs <- as.factor(truth_predicted$obs)
+truth_predicted$pred <- as.factor(truth_predicted$pred)
+
+cm <- conf_mat(truth_predicted, obs, pred)
+
+autoplot(cm, type = "heatmap") +
+  scale_fill_gradient(low = "lightgrey", high = "coral1")
+
+#AUC
+library(pROC)
+tiff(file="MF_BBB_fing_AUC.tiff", width=5, height=5, units="in", res=300)
+
+par(pty = "s") #to obtain a nice squared graph
+roc(XG_BBBval_c1$Status.BBB, XG_BBBval_c1$BBB.Probability.MACCS, plot=TRUE, legacy.axes=TRUE, percent = TRUE, xlab = "False Positive Percentage", ylab = "True Positive Percentage", col = "blue", lwd = "3", print.auc=TRUE, print.auc.y=30)
+plot.roc(XG_BBBtrain_c1$Status.BBB, XG_BBBtrain_c1$BBB.Probability.MACCS, percent = TRUE, col = "darkgreen", lwd = "3", print.auc=TRUE, add=TRUE, print.auc.y=50) # Train set
+plot.roc(XG_BBBtest_c1$Status.BBB, XG_BBBtest_c1$BBB.Probability.MACCS, percent = TRUE, col = "darkorange", lwd = "3", print.auc=TRUE, add=TRUE, print.auc.y=40) # test set
+legend("bottomright", legend = c("Training", "Test", "Validation"), col = c("darkgreen", "darkorange", "blue"), lwd = "3") #create legend 
+par(pty = "m")
+
+dev.off()
+
+# GPLOTS
+aMF_XG_BBB %>% #Status
+  ggplot(aes(x = x.f, 
+             y = y.f,
+             color = Status.BBB))+
+  geom_point(size=1.8, alpha=0.6) +
+  scale_color_manual(breaks = c("0", "1"),
+  values=c("ivory4", "red3")) + #assign colours
+  theme_classic() + theme(legend.position = "none") + ggtitle(" ")
+
+ggsave("MF_BBB_fing_status.png", units="in", width=8, height=7, dpi=300) # Save figure
+
+# GPLOTS
+aMF_XG_BBB %>% # CM whole dataset
+  ggplot(aes(x = x.f, 
+             y = y.f,
+             color = CM.maccs))+
+  geom_point(size=1.5) +
+  scale_color_manual(breaks = c("TP", "TN", "FP", "FN"),
+  values=c("coral3", "coral1", "ivory4", "lightgrey")) + #assign colours
+  theme_classic() + theme(legend.position = "right") + ggtitle(" ")
+
+ggsave("MF_BBB_fing_cm.png", units="in", width=8, height=7, dpi=300) # Save figure
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+####### NOT WORKING PROPERLY FOR FINGERPRINTS #########
+
+# SHAP
+# To return the SHAP values and ranked features by mean|SHAP|
+library(SHAPforxgboost)
+shap_values <- shap.values(xgb_model = bst, X_train = sparse_matrix)
+
+# The ranked features by mean |SHAP|
+# a <- shap_values$mean_shap_score
+# 
+# a <- shap_values$mean_shap_score
+# a <- as.data.frame(a)
+# a[,2] <- rownames(a)
+# ggplot(a, aes(x=V2, y=a, fill=V2)) +
+#   geom_bar(stat="identity") +
+#  scale_fill_brewer("blues") + coord_flip() + theme_classic()
+
+# SHAP values are calculated for each cell in the training dataset. The SHAP values dataset (shap_values$shap_score) has the same dimension (10148,9) as the dataset of the independent variables (10148,9) fit into the xgboost model.
+# The sum of each row’s SHAP values (plus the BIAS column, which is like an intercept) is the predicted model output. As in the following table of SHAP values, rowSum equals the output predict(xgb_mod). I.e., the explanation’s attribution values sum up to the model output (last column in the table below). 
+
+#Shap plots
+#the summary plot shows global feature importance. The sina plots show the distribution of feature contributions to the model output (in this example, the predictions of CWV measurement error) using SHAP values of each feature for every observation. Each dot is an observation (station-day).
+# To prepare the long-format data:
+shap_long <- shap.prep(xgb_model = bst, X_train = as.matrix(sparse_matrix))
+
+# **SHAP summary plot**
+# tiff(file="MF_BBB_fing_shap.tiff", width=6, height=6, units="in", res=300)
+#shap.plot.summary(shap_long) 
+# shap.plot.summary.wrap1(shap_long, X = as.matrix(sparse_matrix), top_n = 10)
+# dev.off()
+
+# Dependence plot
+# g1 <- shap.plot.dependence(data_long = shap_long, x = 'TPSA', y = 'TPSA', color_feature = 'LogD') + ggtitle("(A) SHAP values of TPSA vs. TPSA")
+# g2 <- shap.plot.dependence(data_long = shap_long, x = 'TPSA', y = 'LogD', color_feature = 'HBD') +  ggtitle("(B) SHAP values of LogD vs. TPSA")
+gridExtra::grid.arrange(g1, g2, ncol = 2)
+
+# Here I choose to plot top 4 features using function shap.plot.dependence.
+# Plot SHAP value against feature value, without color_feature but has marginal distribution:
+# tiff(file="MF_BBB_prop_shap2.tiff", width=10, height=6, units="in", res=300)
+# fig_list <- lapply(names(shap_values$mean_shap_score)[1:8], 
+#                    shap.plot.dependence, data_long = shap_long)
+# gridExtra::grid.arrange(grobs = fig_list, ncol = 4)
+# dev.off()
+
+# Interaction effects
+# 
+# SHAP interaction values separate the impact of variable into main effects and interaction effects. They add up roughly to the dependence plot.
+# Quote paper 2: “SHAP interaction values can be interpreted as the difference between the SHAP values for feature i when feature j is present and the SHAP values for feature i when feature j is absent.”
+# The SHAP interaction values take time since it calculates all the combinations.
+# prepare the data using either: 
+# (this step is slow since it calculates all the combinations of features.)
+shap_int <- shap.prep.interaction(xgb_mod = bst, X_train = sparse_matrix)
+
+# **SHAP interaction effect plot **
+# if `data_int` is supplied, the same function will plot the interaction effect:
+tiff(file="MF_BBB_prop_shap3.tiff", width=8, height=6, units="in", res=300)
+g3 <- shap.plot.dependence(data_long = shap_long,
+                           data_int = shap_int,
+                           x= "V139", y = "V146", 
+                           color_feature = "V146")
+g4 <- shap.plot.dependence(data_long = shap_long,
+                           data_int = shap_int,
+                           x= "V139", y = "V139", 
+                           color_feature = "V139")
+g5 <- shap.plot.dependence(data_long = shap_long,
+                           data_int = shap_int,
+                           x= "V8", y = "V54", 
+                           color_feature = "V54")
+g6 <- shap.plot.dependence(data_long = shap_long,
+                           data_int = shap_int,
+                           x= "V99", y = "V156", 
+                           color_feature = "V156")
+gridExtra::grid.arrange(g3, g4, g5, g6, ncol=2)
+dev.off()
+
+# SHAP force plot
+# The SHAP force plot basically stacks these SHAP values for each observation, and show how the final output was obtained as a sum of each predictor’s attributions.
+
+# choose to show top 4 features by setting `top_n = 4`, 
+# set 6 clustering groups of observations.  
+plot_data <- shap.prep.stack.data(shap_contrib = shap_values$shap_score, top_n = 4, n_groups = 1)
+# you may choose to zoom in at a location, and set y-axis limit using `y_parent_limit`  
+shap.plot.force_plot(plot_data,zoom_in_location = 100)
+#plot the clusters
+#plot the clusters
+tiff(file="MF_BBB_fing_shap4.tiff", width=8, height=6, units="in", res=300)
+shap.plot.force_plot_bygroup(plot_data)
+dev.off()
+  
+```
+
+```{r cars}
+#TREE 
+aMF_XG_BBB$leaf <- NA
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 0 & aMF_BBB_MACCS$V131 == 0 & aMF_BBB_MACCS$V49 == 0 &  aMF_BBB_MACCS$V139 == 0 & aMF_BBB_MACCS$Status.BBB == 1] <- "1a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 0 & aMF_BBB_MACCS$V131 == 0 & aMF_BBB_MACCS$V49 == 0 &  aMF_BBB_MACCS$V139 == 0 & aMF_BBB_MACCS$Status.BBB == 0] <- "1b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 0 & aMF_BBB_MACCS$V131 == 0 & aMF_BBB_MACCS$V49 == 0 &  aMF_BBB_MACCS$V139 == 1 & aMF_BBB_MACCS$Status.BBB == 1] <- "2a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 0 & aMF_BBB_MACCS$V131 == 0 & aMF_BBB_MACCS$V49 == 0 &  aMF_BBB_MACCS$V139 == 1 & aMF_BBB_MACCS$Status.BBB == 0] <- "2b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 0 & aMF_BBB_MACCS$V131 == 0 & aMF_BBB_MACCS$V49 == 1 &  aMF_BBB_MACCS$V152 == 0 & aMF_BBB_MACCS$Status.BBB == 1] <- "3a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 0 & aMF_BBB_MACCS$V131 == 0 & aMF_BBB_MACCS$V49 == 1 &  aMF_BBB_MACCS$V152 == 0 & aMF_BBB_MACCS$Status.BBB == 0] <- "3b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 0 & aMF_BBB_MACCS$V131 == 0 & aMF_BBB_MACCS$V49 == 1 &  aMF_BBB_MACCS$V152 == 1 & aMF_BBB_MACCS$Status.BBB == 1] <- "4a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 0 & aMF_BBB_MACCS$V131 == 0 & aMF_BBB_MACCS$V49 == 1 &  aMF_BBB_MACCS$V152 == 1 & aMF_BBB_MACCS$Status.BBB == 0] <- "4b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 0 & aMF_BBB_MACCS$V131 == 1 & aMF_BBB_MACCS$V125 == 0 &  aMF_BBB_MACCS$V41 == 0 & aMF_BBB_MACCS$Status.BBB == 1] <- "5a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 0 & aMF_BBB_MACCS$V131 == 1 & aMF_BBB_MACCS$V125 == 0 &  aMF_BBB_MACCS$V41 == 0 & aMF_BBB_MACCS$Status.BBB == 0] <- "5b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 0 & aMF_BBB_MACCS$V131 == 1 & aMF_BBB_MACCS$V125 == 0 &  aMF_BBB_MACCS$V41 == 1 & aMF_BBB_MACCS$Status.BBB == 1] <- "6a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 0 & aMF_BBB_MACCS$V131 == 1 & aMF_BBB_MACCS$V125 == 0 &  aMF_BBB_MACCS$V41 == 1 & aMF_BBB_MACCS$Status.BBB == 0] <- "6b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 0 & aMF_BBB_MACCS$V131 == 1 & aMF_BBB_MACCS$V125 == 1 &  aMF_BBB_MACCS$V136 == 0 & aMF_BBB_MACCS$Status.BBB == 1] <- "7a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 0 & aMF_BBB_MACCS$V131 == 1 & aMF_BBB_MACCS$V125 == 1 &  aMF_BBB_MACCS$V136 == 0 & aMF_BBB_MACCS$Status.BBB == 0] <- "7b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 0 & aMF_BBB_MACCS$V131 == 1 & aMF_BBB_MACCS$V125 == 1 &  aMF_BBB_MACCS$V136 == 1 & aMF_BBB_MACCS$Status.BBB == 1] <- "8a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 0 & aMF_BBB_MACCS$V131 == 1 & aMF_BBB_MACCS$V125 == 1 &  aMF_BBB_MACCS$V136 == 1 & aMF_BBB_MACCS$Status.BBB == 0] <- "8b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 1 & aMF_BBB_MACCS$V146 == 0 & aMF_BBB_MACCS$V142 == 0 &  aMF_BBB_MACCS$V66 == 0 & aMF_BBB_MACCS$Status.BBB == 1] <- "9a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 1 & aMF_BBB_MACCS$V146 == 0 & aMF_BBB_MACCS$V142 == 0 &  aMF_BBB_MACCS$V66 == 0 & aMF_BBB_MACCS$Status.BBB == 0] <- "9b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 1 & aMF_BBB_MACCS$V146 == 0 & aMF_BBB_MACCS$V142 == 0 & aMF_BBB_MACCS$V66 == 1 & aMF_BBB_MACCS$Status.BBB == 1] <- "10a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 1 & aMF_BBB_MACCS$V146 == 0 & aMF_BBB_MACCS$V142 == 0 & aMF_BBB_MACCS$V66 == 1 & aMF_BBB_MACCS$Status.BBB == 0] <- "10b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 1 & aMF_BBB_MACCS$V146 == 0 & aMF_BBB_MACCS$V142 == 1 &  aMF_BBB_MACCS$V25 == 0 & aMF_BBB_MACCS$Status.BBB == 1] <- "11a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 1 & aMF_BBB_MACCS$V146 == 0 & aMF_BBB_MACCS$V142 == 1 &  aMF_BBB_MACCS$V25 == 0 & aMF_BBB_MACCS$Status.BBB == 0] <- "11b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 1 & aMF_BBB_MACCS$V146 == 0 & aMF_BBB_MACCS$V142 == 1 &  aMF_BBB_MACCS$V25 == 1 & aMF_BBB_MACCS$Status.BBB == 1] <- "12a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 1 & aMF_BBB_MACCS$V146 == 0 & aMF_BBB_MACCS$V142 == 1 &  aMF_BBB_MACCS$V25 == 1 & aMF_BBB_MACCS$Status.BBB == 0] <- "12b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 1 & aMF_BBB_MACCS$V146 == 1 & aMF_BBB_MACCS$V89 == 0 &  aMF_BBB_MACCS$V115 == 0 & aMF_BBB_MACCS$Status.BBB == 1] <- "13a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 1 & aMF_BBB_MACCS$V146 == 1 & aMF_BBB_MACCS$V89 == 0 &  aMF_BBB_MACCS$V115 == 0 & aMF_BBB_MACCS$Status.BBB == 0] <- "13b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 1 & aMF_BBB_MACCS$V146 == 1 & aMF_BBB_MACCS$V89 == 0 &  aMF_BBB_MACCS$V115 == 1 & aMF_BBB_MACCS$Status.BBB == 1] <- "14a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 1 & aMF_BBB_MACCS$V146 == 1 & aMF_BBB_MACCS$V89 == 0 &  aMF_BBB_MACCS$V115 == 1 & aMF_BBB_MACCS$Status.BBB == 0] <- "14b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 1 & aMF_BBB_MACCS$V146 == 1 & aMF_BBB_MACCS$V89 == 1 &  aMF_BBB_MACCS$V145 == 0 & aMF_BBB_MACCS$Status.BBB == 1] <- "15a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 1 & aMF_BBB_MACCS$V146 == 1 & aMF_BBB_MACCS$V89 == 1 &  aMF_BBB_MACCS$V145 == 0 & aMF_BBB_MACCS$Status.BBB == 0] <- "15b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 1 & aMF_BBB_MACCS$V146 == 1 & aMF_BBB_MACCS$V89 == 1 &  aMF_BBB_MACCS$V145 == 1 & aMF_BBB_MACCS$Status.BBB == 1] <- "16a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 0 & aMF_BBB_MACCS$V54 == 1 & aMF_BBB_MACCS$V146 == 1 & aMF_BBB_MACCS$V89 == 1 &  aMF_BBB_MACCS$V145 == 1 & aMF_BBB_MACCS$Status.BBB == 0] <- "16b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 1 & aMF_BBB_MACCS$V140 == 0 & aMF_BBB_MACCS$Status.BBB == 1] <- "17a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 1 & aMF_BBB_MACCS$V140 == 0 & aMF_BBB_MACCS$Status.BBB == 0] <- "17b"
+
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 1 & aMF_BBB_MACCS$V140 == 1 & aMF_BBB_MACCS$Status.BBB == 1] <- "18a"
+aMF_XG_BBB$leaf[aMF_BBB_MACCS$V8 == 1 & aMF_BBB_MACCS$V140 == 1 & aMF_BBB_MACCS$Status.BBB == 0] <- "18b"
+
+
+# when your missing leafs (and want to count per leaf)
+aMF_XG_BBB$leaf <- as.factor(aMF_XG_BBB$leaf)
+summary(aMF_XG_BBB$leaf)
+
+
+aMF_XG_BBB %>% # overview leafs vs CM
+  ggplot(aes(x = x.f, 
+             y = y.f,
+             color = leaf, shape = CM.maccs))+
+  geom_point(size=2) +
+  scale_shape_manual(values=c(5,2,18,20)) + 
+  theme_classic() + theme(legend.position = "right") + ggtitle(" ")
+
+ggsave("MF_BBB_fing_leaf.png", units="in", width=8, height=7, dpi=300) # Save figure
+
+
+#########################
+# Visualize certain MACCS positions if interested
+test <- aMF_XG_BBB[,c(22,23,37)]
+test <- cbind(test, aMF_BBB_MACCS)
+
+test$Status.BBB <- as.factor(test$Status.BBB)
+test$V8 <- as.factor(test$V8)
+test$V54 <- as.factor(test$V54)
+test$V140 <- as.factor(test$V140)
+
+test$com <- 0 
+test$com[test$V8 == 1 & test$V140 == 1] <- 1
+test$com <- as.factor(test$com)
+
+test %>% #Status
+  ggplot(aes(x = x.f, 
+             y = y.f,
+             color = V8))+
+  geom_point(size=1.8, alpha=0.6) +
+  scale_color_manual(breaks = c("0", "1"),
+  values=c("snow2", "#79A7F2")) + #assign colours
+  theme_classic() + theme(legend.position = "none") + ggtitle(" ")
+
+ggsave("MF_BBB_fing_MACCS_V8.png", units="in", width=8, height=7, dpi=300) # Save figure
+
+
+test %>% #Status
+  ggplot(aes(x = x.f, 
+             y = y.f,
+             color = V54))+
+  geom_point(size=1.8, alpha=0.6) +
+  scale_color_manual(breaks = c("0", "1"),
+  values=c("snow2", "orange")) + #assign colours
+  theme_classic() + theme(legend.position = "none") + ggtitle(" ")
+
+ggsave("MF_BBB_fing_MACCS_V54.png", units="in", width=8, height=7, dpi=300) # Save figure
+
+test %>% #Status
+  ggplot(aes(x = x.f, 
+             y = y.f,
+             color = com))+
+  geom_point(size=1.8, alpha=0.6) +
+  scale_color_manual(breaks = c("0", "1"),
+  values=c("snow2", "orange")) + #assign colours
+  theme_classic() + theme(legend.position = "none") + ggtitle(" ")
+
+ggsave("MF_BBB_fing_MACCS_V8V140.png", units="in", width=8, height=7, dpi=300) # Save figure
+
+test$leaf2 <- 0
+test$leaf2[test$V8 == 1 & test$V140 == 1] <- 1
+test$leaf2 <- as.factor(test$leaf2)
+test$leaf3 <- 0
+test$leaf3[test$V8 == 1 & test$V140 == 0] <- 1
+test$leaf3 <- as.factor(test$leaf3)
+test$leaf1 <- 0
+test$leaf1[test$leaf == "1a" | test$leaf  == "1b"] <- 1
+test$leaf1 <- as.factor(test$leaf1)
+
+
+test %>% #Status
+  ggplot(aes(x = x.f, 
+             y = y.f,
+             color = leaf2)) +
+  geom_point(size=1.8, alpha=0.6) +
+  scale_color_manual(breaks = c("0", "1"),
+  values=c("snow2", "orange")) + #assign colours
+  theme_classic() + theme(legend.position = "none") + ggtitle(" ")
+
+ggsave("MF_BBB_fing_MACCS_V8+V140+.png", units="in", width=8, height=7, dpi=300) # Save figure
+
+test %>% #Status
+  ggplot(aes(x = x.f, 
+             y = y.f,
+             color = leaf3)) +
+  geom_point(size=1.8, alpha=0.6) +
+  scale_color_manual(breaks = c("0", "1"),
+  values=c("snow2", "deeppink")) + #assign colours
+  theme_classic() + theme(legend.position = "none") + ggtitle(" ")
+
+ggsave("MF_BBB_fing_MACCS_V8+V140-.png", units="in", width=8, height=7, dpi=300) # Save figure
+
+test %>% #Status
+  ggplot(aes(x = x.f, 
+             y = y.f,
+             color = leaf1)) +
+  geom_point(size=1.8, alpha=0.6) +
+  scale_color_manual(breaks = c("0", "1"),
+  values=c("snow2", "orange")) + #assign colours
+  theme_classic() + theme(legend.position = "none") + ggtitle(" ")
+
+ggsave("MF_BBB_fing_MACCS_leaf1.png", units="in", width=8, height=7, dpi=300) # Save figure
+
+
+
+
+
+
+
+ 
+```
+
+```{r cars}
+summary(cars)
+```
+
+```{r cars}
+summary(cars)
+```
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
