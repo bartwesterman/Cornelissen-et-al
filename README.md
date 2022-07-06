@@ -2,7 +2,7 @@
 
 ## Explaining blood-brain barrier permeability of small molecules by integrated comparison of different transport mechanisms
 ____________________________________________________________________________________________________________________________________________________
-#### [data](https://github.com/bartwesterman/Cornelissen-et-al./tree/Prediction-models)
+#### [Source data](https://github.com/bartwesterman/Cornelissen-et-al./tree/Prediction-models)
 #### [Prediction models](https://github.com/bartwesterman/Cornelissen-et-al./tree/Prediction-models)
 #### [Molecular substructures](https://github.com/bartwesterman/Cornelissen-et-al./tree/Representation-of-molecules) 
 ____________________________________________________________________________________________________________________________________________________
